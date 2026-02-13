@@ -135,10 +135,10 @@ if __name__ == '__main__':
         h_in = h.detach().requires_grad_(True)
 
         J = torch.autograd.functional.jacobian(forward_through_layer, h_in)
-
+        print("DONE with backprop")
         J = J.reshape(seq_len * mmodel.model.config.hidden_size,
                       seq_len * mmodel.model.config.hidden_size)
-        jacobians.append(J)
+        # jacobians.append(J)
 
         # Advance h to the next layer's output (no grad needed)
         with torch.no_grad():
@@ -153,6 +153,7 @@ if __name__ == '__main__':
                 position_embeddings=position_embeddings,
                 cache_position=cache_position,
             )
+        
 
             
         # word_prob = 1.0
