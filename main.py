@@ -120,7 +120,7 @@ class KFAC:
 
         for name, module in layer.named_modules():
             if isinstance(module, nn.Linear):
-                print(name, ":", module)
+                # print(name, ":", module)
                 def fwd_hook(mod, inp, out, _name=name):
                     # inp[0] is (batch, seq, d_in)
                     activations[_name] = inp[0].detach()
@@ -150,6 +150,10 @@ if __name__ == '__main__':
     input_ids = mmodel.tokenize(prompt)
     seq_len = input_ids.shape[1]
     negative_ids = mmodel.tokenize(" negative").to(mmodel.model.device)
+    tokens = mmodel.tokenizer.encode(" negative", add_special_tokens=False)
+    print(tokens)
+    print(negative_ids)
+    print([mmodel.tokenizer.decode(t) for t in tokens])
 
     jacobians = []
     layers = mmodel.model.model.layers
@@ -188,9 +192,7 @@ if __name__ == '__main__':
         target_out = mmodel.forward_layer(l, inputs_for_layer, no_grad=False)
 
         h = target_out.hidden_states
-        if isinstance(h, tuple):
-            print("istuple")
-            h = h[0]
+        
         for i in range(l + 1, len(layers)):
             # layer_out = layers[i](
             #     hidden_states=h,
@@ -208,7 +210,8 @@ if __name__ == '__main__':
 
         # 4. Compute a loss to backprop (Fisher uses sampled labels)
         log_prob = torch.log_softmax(logits[0, -1, :], dim=-1).to(mmodel.model.device)
-        score = log_prob[negative_ids].sum()
+        score = log_prob[negative_ids[0][1]]
+        print(f"this module's score is: {score}")
 
         # 5. Backward — hooks fire and capture g_out for each Linear
         score.backward()
@@ -220,12 +223,34 @@ if __name__ == '__main__':
             g = gradients[name]    # (batch, seq, d_out)
             print(f"  {name:40s}  a: {a.shape}  g: {g.shape}")
 
+        #### KFAC test
+        for name, module in layer.named_modules():
+            if isinstance(module, nn.Linear) and name in activations:
+                a = activations[name]  # (1, T, d_in)
+                g = gradients[name]    # (1, T, d_out)
+                
+                # Flatten batch and seq dims
+                a_flat = a.reshape(-1, a.shape[-1])   # (T, d_in)
+                g_flat = g.reshape(-1, g.shape[-1])   # (T, d_out)
+                
+                # KFAC-reconstructed weight grad
+                reconstructed = g_flat.T @ a_flat     # (d_out, d_in)
+                
+                # PyTorch's actual weight grad
+                actual = module.weight.grad            # (d_out, d_in)
+                
+                if actual is not None:
+                    diff = (reconstructed.to(actual.device) - actual).abs()
+                    print(f"{name:40s}  max_diff: {diff.max().item():.6f}  mean_diff: {diff.mean().item():.6f}")
+                else:
+                    print(f"{name:40s}  no .grad found (weight may not require grad)")
+
         # 7. Cleanup hooks
         for handle in handles:
             handle.remove()
 
         # 8. Advance layer_inputs for the next iteration (no grad, as before)
-        # layer_inputs = mmodel.forward_layer(l, layer_inputs, no_grad=True)
+        layer_inputs = mmodel.forward_layer(l, layer_inputs, no_grad=True)
 
 
 
