@@ -10,3 +10,5 @@ print("Top-k singular values:")
 for i, s in enumerate(S):
     print(f"{i+1}: {s:.4f}")
 del U, S, Vh, J_np, J
+
+

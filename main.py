@@ -2,12 +2,12 @@ import os
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 from transformers.models.llama.modeling_llama import create_causal_mask
 import dataclasses
 from dataclasses import dataclass
 import contextlib
 from tqdm import tqdm
+from pprint import pprint
 
 @dataclass
 class LayerInputs:
@@ -107,8 +107,15 @@ class MyModel:
             
 
 class KFAC:
-    def __init__(self):
-        pass
+    def __init__(self, mmodel, layers, target_token_id):
+        self.mmodel = mmodel
+        self.layers = layers
+        self.target_token_id = target_token_id
+        
+        self.factors = {}
+        self.eigenvalues = {}
+        self.max_eigenvalues = {}
+        self.top_eigenvectors = {}
 
     # --- Hook setup ---
     @staticmethod
@@ -133,6 +140,164 @@ class KFAC:
                 handles.append(module.register_full_backward_hook(bwd_hook))
 
         return handles, activations, gradients
+    
+    def compute_layer_gradients(
+        mmodel,
+        layer_inputs: LayerInputs,
+        layer_idx: int,
+        target_token_id: int,
+        layers: list,
+    ) -> tuple[dict, dict]:
+        """
+        Runs a forward pass from layer_idx to the final output, computes
+        the log probability of target_token_id, and backpropagates.
+        Returns (activations, gradients) dicts keyed by linear layer name.
+        """
+        mmodel.model.zero_grad()
+
+        layer = layers[layer_idx]
+        handles, activations, gradients = KFAC.register_kfac_hooks(layer)
+
+        # Detach input and make it a fresh leaf so gradients don't flow further back
+        h_in = layer_inputs.hidden_states.detach().requires_grad_(True)
+        inputs_for_layer = dataclasses.replace(layer_inputs, hidden_states=h_in)
+
+        # Forward through layer l
+        out = mmodel.forward_layer(layer_idx, inputs_for_layer, no_grad=False)
+        h = out.hidden_states
+
+        # Forward through remaining layers
+        for i in range(layer_idx + 1, len(layers)):
+            out_i = mmodel.forward_layer(i, dataclasses.replace(layer_inputs, hidden_states=h), no_grad=False)
+            h = out_i.hidden_states
+
+        # Compute loss and backprop
+        logits = mmodel.lm_head(mmodel.norm(h))
+        log_prob = torch.log_softmax(logits[0, -1, :], dim=-1)
+        score = log_prob[target_token_id]
+        score.backward()
+
+        # Cleanup
+        for handle in handles:
+            handle.remove()
+
+        return activations, gradients
+    
+    
+    
+    def compute_kfac_factors(activations: dict, gradients: dict) -> dict:
+        """
+        Computes KFAC factors A and G for each linear layer.
+        A = a_flat.T @ a_flat  (d_in, d_in)
+        G = g_flat.T @ g_flat  (d_out, d_out)
+        Returns a dict keyed by layer name with (A, G) tuples.
+        """
+        factors = {}
+
+        for name in activations:
+            a = activations[name]
+            g = gradients[name]
+
+            a_flat = a.reshape(-1, a.shape[-1])
+            g_flat = g.reshape(-1, g.shape[-1])
+            print(a_flat.abs().max(), a_flat.abs().mean())
+            
+            A = (a_flat.double().T @ a_flat.double())
+            G = (g_flat.double().T @ g_flat.double())
+
+            factors[name] = (A, G)
+
+        return factors
+    
+    
+    def collect_factors(self, layer_inputs: LayerInputs, verify: bool = False):
+        """
+        Runs forward/backward passes across all layers to collect KFAC factors.
+        Populates self.factors as {layer_idx: {linear_name: (A, G)}}.
+        """
+        for l, layer in enumerate(tqdm(self.layers)):
+            activations, gradients = KFAC.compute_layer_gradients(
+                self.mmodel, layer_inputs, l, self.target_token_id, self.layers
+            )
+
+            if verify:
+                results = KFAC.verify_reconstruction(layer, activations, gradients)
+                for name, diff in results.items():
+                    if diff is not None:
+                        print(f"  {name:40s}  max_diff: {diff[0]:.6f}  mean_diff: {diff[1]:.6f}")
+                    else:
+                        print(f"  {name:40s}  no .grad found")
+
+            print(l, ": ")
+            self.factors[l] = KFAC.compute_kfac_factors(activations, gradients)
+
+            layer_inputs = self.mmodel.forward_layer(l, layer_inputs)
+    
+
+    @staticmethod
+    def verify_reconstruction(layer: nn.Module, activations: dict, gradients: dict) -> dict:
+        """
+        For each linear layer, checks whether g.T @ a matches module.weight.grad.
+        Returns a dict keyed by layer name with (max_diff, mean_diff) tuples.
+        """
+        results = {}
+
+        for name, module in layer.named_modules():
+            if isinstance(module, nn.Linear) and name in activations:
+                a = activations[name]
+                g = gradients[name]
+
+                a_flat = a.reshape(-1, a.shape[-1])
+                g_flat = g.reshape(-1, g.shape[-1])
+
+                reconstructed = g_flat.T @ a_flat
+                actual = module.weight.grad
+
+                if actual is not None:
+                    diff = (reconstructed.to(actual.device) - actual).abs()
+                    results[name] = (diff.max().item(), diff.mean().item())
+                else:
+                    results[name] = None
+
+        return results
+    
+    def compute_eigenvalues(self):
+        """
+        Computes the top eigenvalue of A and G for each linear layer in each transformer layer.
+        Populates self.eigenvalues as {layer_idx: {linear_name: (eig_A, eig_G)}}
+        and self.max_eigenvalues as {layer_idx: {linear_name: eig_A * eig_G}}.
+        """
+        for l, layer_factors in tqdm(self.factors.items()):
+            self.eigenvalues[l] = {}
+            self.max_eigenvalues[l] = {}
+            self.top_eigenvectors[l] = {}
+
+            for name, (A, G) in layer_factors.items():
+        
+                # eigvalsh returns eigenvalues in ascending order, so take the last one
+                # eig_A = torch.linalg.eigvalsh(A)[-1].item()
+                # eig_G = torch.linalg.eigvalsh(G)[-1].item()
+                eigs_A, vecs_A = torch.linalg.eigh(A)
+                eigs_G, vecs_G = torch.linalg.eigh(G)
+
+                # Max eigenvalues of A and G
+                eig_A = eigs_A[-1].item()
+                eig_G = eigs_G[-1].item()
+
+                # Max eigenvectors of A and G
+                top_vec_A = vecs_A[:, -1]   # (d_in,)
+                top_vec_G = vecs_G[:, -1]   # (d_out,)
+
+                self.eigenvalues[l][name] = (eig_A, eig_G)
+                self.max_eigenvalues[l][name] = eig_A * eig_G
+                self.top_eigenvectors[l][name] = torch.outer(top_vec_G, top_vec_A).view(-1)
+
+
+    def run(self, layer_inputs: LayerInputs, verify: bool = False):
+        self.collect_factors(layer_inputs, verify)
+        self.compute_eigenvalues()
+        return self.max_eigenvalues
+
 
 
 if __name__ == '__main__':
@@ -150,10 +315,9 @@ if __name__ == '__main__':
     input_ids = mmodel.tokenize(prompt)
     seq_len = input_ids.shape[1]
     negative_ids = mmodel.tokenize(" negative").to(mmodel.model.device)
-    tokens = mmodel.tokenizer.encode(" negative", add_special_tokens=False)
-    print(tokens)
-    print(negative_ids)
-    print([mmodel.tokenizer.decode(t) for t in tokens])
+    # tokens = mmodel.tokenizer.encode(" negative", add_special_tokens=False)
+    target_token_id = mmodel.tokenizer.encode(" negative", add_special_tokens=False)
+
 
     jacobians = []
     layers = mmodel.model.model.layers
@@ -163,94 +327,75 @@ if __name__ == '__main__':
     chunk_size = 256
 
 
-    # def forward_through_layer(h):
-    #     print("Hidden size:", layer.hidden_size)
-    #     print("self_attn", layer.self_attn)
-    #     print("MLP", layer.mlp)
-    #     print(mmodel.model.config._attn_implementation)
+    kfac = KFAC(mmodel, layers, target_token_id)
+    max_eigenvalues = kfac.run(layer_inputs)
+    pprint(max_eigenvalues)
 
-    #     out = layer(
-    #         hidden_states=h,
-    #         attention_mask=causal_mask,
-    #         position_embeddings=position_embeddings,
-    #         position_ids=position_ids,
-    #         past_key_values=None,
-    #         cache_position=cache_position
-    #     )
-    #     return out[0].reshape(-1) 
-    
-    for l, layer in enumerate(tqdm(layers)):
-        print(f"\n=== Layer {l} ===")
-        os.makedirs(f"jacobians/layer_{l}", exist_ok=True)
+
+    # for l, layer in enumerate(tqdm(layers)):
+    #     print(f"\n=== Layer {l} ===")
+    #     os.makedirs(f"jacobians/layer_{l}", exist_ok=True)
         
+    #     mmodel.model.zero_grad()
+    #     #FIM    
+    #     handles, activations, gradients = KFAC.register_kfac_hooks(layer)
+    #     # Forward through target layer WITH grad
+    #     h_in = layer_inputs.hidden_states.detach().requires_grad_(True)
+    #     inputs_for_layer = dataclasses.replace(layer_inputs, hidden_states=h_in)
+    #     target_out = mmodel.forward_layer(l, inputs_for_layer, no_grad=False)
+
+    #     h = target_out.hidden_states
         
-        #FIM    
-        handles, activations, gradients = KFAC.register_kfac_hooks(layer)
-        # Forward through target layer WITH grad
-        h_in = layer_inputs.hidden_states.detach().requires_grad_(True)
-        inputs_for_layer = dataclasses.replace(layer_inputs, hidden_states=h_in)
-        target_out = mmodel.forward_layer(l, inputs_for_layer, no_grad=False)
+    #     # Forward pass through rest of model (layer+1)
+    #     for i in range(l + 1, len(layers)):
+    #         layer_inputs_i = mmodel.forward_layer(i, dataclasses.replace(layer_inputs, hidden_states=h), no_grad=False)
+    #         h = layer_inputs_i.hidden_states
 
-        h = target_out.hidden_states
-        
-        for i in range(l + 1, len(layers)):
-            # layer_out = layers[i](
-            #     hidden_states=h,
-            #     attention_mask=layer_inputs.causal_mask,
-            #     position_embeddings=layer_inputs.position_embeddings,
-            #     position_ids=layer_inputs.position_ids,
-            #     past_key_values=None,
-            #     cache_position=layer_inputs.cache_position,
-            # )
-            # h = layer_out[0] if isinstance(layer_out, tuple) else h
-            layer_inputs_i = mmodel.forward_layer(i, dataclasses.replace(layer_inputs, hidden_states=h), no_grad=False)
-            h = layer_inputs_i.hidden_states
+    #     logits = mmodel.lm_head(mmodel.norm(h))  # (batch, seq, vocab)
 
-        logits = mmodel.lm_head(mmodel.norm(h))  # (batch, seq, vocab)
+    #     # 4. Compute a loss to backprop (Fisher uses sampled labels)
+    #     log_prob = torch.log_softmax(logits[0, -1, :], dim=-1).to(mmodel.model.device)
+    #     score = log_prob[negative_ids[0][1]]
+    #     print(f"this module's score is: {score}")
 
-        # 4. Compute a loss to backprop (Fisher uses sampled labels)
-        log_prob = torch.log_softmax(logits[0, -1, :], dim=-1).to(mmodel.model.device)
-        score = log_prob[negative_ids[0][1]]
-        print(f"this module's score is: {score}")
-
-        # 5. Backward — hooks fire and capture g_out for each Linear
-        score.backward()
+    #     # 5. Backward — hooks fire and capture g_out for each Linear
+    #     score.backward()
         
 
-        # 6. Inspect what we captured
-        for name in activations:
-            a = activations[name]  # (batch, seq, d_in)
-            g = gradients[name]    # (batch, seq, d_out)
-            print(f"  {name:40s}  a: {a.shape}  g: {g.shape}")
+    #     # 6. Inspect what we captured
+    #     for name in activations:
+    #         a = activations[name]  # (batch, seq, d_in)
+    #         g = gradients[name]    # (batch, seq, d_out)
+    #         print(f"  {name:40s}  a: {a.shape}  g: {g.shape}")
 
-        #### KFAC test
-        for name, module in layer.named_modules():
-            if isinstance(module, nn.Linear) and name in activations:
-                a = activations[name]  # (1, T, d_in)
-                g = gradients[name]    # (1, T, d_out)
+    #     #### KFAC test
+    #     for name, module in layer.named_modules():
+    #         if isinstance(module, nn.Linear) and name in activations:
+    #             a = activations[name]  # (1, T, d_in)
+    #             g = gradients[name]    # (1, T, d_out)
                 
-                # Flatten batch and seq dims
-                a_flat = a.reshape(-1, a.shape[-1])   # (T, d_in)
-                g_flat = g.reshape(-1, g.shape[-1])   # (T, d_out)
+    #             # Flatten batch and seq dims
+    #             a_flat = a.reshape(-1, a.shape[-1])   # (T, d_in)
+    #             g_flat = g.reshape(-1, g.shape[-1])   # (T, d_out)
                 
-                # KFAC-reconstructed weight grad
-                reconstructed = g_flat.T @ a_flat     # (d_out, d_in)
+    #             # KFAC-reconstructed weight grad
+    #             reconstructed = g_flat.T @ a_flat     # (d_out, d_in)
                 
-                # PyTorch's actual weight grad
-                actual = module.weight.grad            # (d_out, d_in)
+    #             # PyTorch's actual weight grad
+    #             actual = module.weight.grad            # (d_out, d_in)
                 
-                if actual is not None:
-                    diff = (reconstructed.to(actual.device) - actual).abs()
-                    print(f"{name:40s}  max_diff: {diff.max().item():.6f}  mean_diff: {diff.mean().item():.6f}")
-                else:
-                    print(f"{name:40s}  no .grad found (weight may not require grad)")
+    #             if actual is not None:
+    #                 diff = (reconstructed.to(actual.device) - actual).abs()
+    #                 print(f"{name:40s}  max_diff: {diff.max().item():.6f}  mean_diff: {diff.mean().item():.6f}")
+    #             else:
+    #                 print(f"{name:40s}  no .grad found (weight may not require grad)")
 
-        # 7. Cleanup hooks
-        for handle in handles:
-            handle.remove()
+    #     # 7. Cleanup hooks
+    #     for handle in handles:
+    #         handle.remove()
 
-        # 8. Advance layer_inputs for the next iteration (no grad, as before)
-        layer_inputs = mmodel.forward_layer(l, layer_inputs, no_grad=True)
+    #     # 8. Advance layer_inputs for the next iteration (no grad, as before)
+    #     layer_inputs = mmodel.forward_layer(l, layer_inputs)
 
 
 
@@ -270,7 +415,7 @@ if __name__ == '__main__':
         #     J = J.reshape(output_end - output_start, J_size)
             
         #     J_path = f"jacobians/layer_{l}/shard_{chunk_idx}.pt"
-        #     torch.save(J.float().cpu(), J_path)
+        #     # torch.save(J.float().cpu(), J_path)
             
         #     print(J.shape)
         #     del J
