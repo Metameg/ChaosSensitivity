@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.llama.modeling_llama import create_causal_mask
@@ -9,7 +10,7 @@ from tqdm import tqdm
 from pprint import pprint
 from KFAC import KFAC, KFACVisualizer
 from data_types import LayerInputs
-from Jacobian import Jacobian
+from Jacobian import Jacobian, JacobianVisualizer
 
 
 class MyModel:
@@ -124,66 +125,51 @@ if __name__ == '__main__':
     target_token_id = mmodel.tokenizer.encode(" negative", add_special_tokens=False)
 
 
-    # jacobians = []
-    # layers = mmodel.model.model.layers
 
     layer_inputs = mmodel.prepare_layer_inputs(input_ids)
-    # J_size = seq_len * mmodel.model.config.hidden_size
+    J_size = seq_len * mmodel.model.config.hidden_size
     
 
 
+    # layers = mmodel.model.model.layers
     # kfac = KFAC(mmodel, layers, target_token_id)
     # max_eigenvalues, gradient_projections = kfac.run(layer_inputs)
 
-    # viz = KFACVisualizer(kfac)
+    # kfac_viz = KFACVisualizer(kfac)
 
     # # Raw projection heatmap + layer summary
-    # viz.plot_all(save_path="kfac_raw.png")
+    # kfac_viz.plot_all(save_path="kfac_raw.png")
 
     # # Curvature-weighted version
-    # # viz.plot_all(scale_by_curvature=True, save_path="kfac_weighted.png")
-    # viz.plot_layer_summary()
-    # viz.plot_quiver(save_path="quiver.png")
+    # # kfac_viz.plot_all(scale_by_curvature=True, save_path="kfac_weighted.png")
+    # kfac_viz.plot_layer_summary()
+    # kfac_viz.plot_quiver(save_path="quiver.png")
 
-    jac = Jacobian(mmodel, layer_inputs, save_dir="jacobians", chunk_size=256)
+    jac = Jacobian(mmodel, 
+                   layer_inputs,
+                   save_dir="jacobians_threaded",
+                   chunk_size=256,
+                   start_layer=1)
     jac.compute()
+    # Reload shards and rerun power iteration for all layers
+    # n_layers = len(mmodel.model.model.layers)
+    # for l in range(0, 3):
+    #     jac._reload_manifest_from_disk(l)
+    #     jac.spectral_norm_from_disk(l)  # populates spectral_norms and converged_vectors
 
-    # Later, to reconstruct layer 3:
-    # J_full = jac.load(3)
 
-    # pprint(max_eigenvalues)
+    # # Decode tokens for the sensitivity heatmap x-axis
+    # token_ids = input_ids[0].tolist()
+    # token_labels = [mmodel.tokenizer.decode([t]) for t in token_ids]
 
-    # print("Gradient Projections")
-    # pprint(gradient_projections)
+    # # jac_viz = JacobianVisualizer(jac)
+    # # jac_viz.plot_spectral_profile(kfac=kfac, save_path="plots/spectral_profile_jacobian.png")
+    # # jac_viz.plot_sensitivity_heatmap(token_labels=token_labels, save_path="plots/jacobian_sensitivity_heatmap.png")
+    # # jac_viz.plot_correlation_scatter(kfac, save_path="plots/eigen-singular-correlation.png")
+    
 
-    # for l, layer in enumerate(tqdm(layers)):
-    #     print(f"\n=== Layer {l} ===")
-    #     os.makedirs(f"jacobians/layer_{l}", exist_ok=True)
-        
 
-    #     #JACOBIAN
-    #     for chunk_idx, output_start in enumerate(range(0, J_size, chunk_size)):
-
-    #         output_end = min(output_start + chunk_size, J_size)
-    #         h_in = layer_inputs.hidden_states.detach().requires_grad_(True)
-
-    #         inputs_for_jacobian = dataclasses.replace(layer_inputs, hidden_states=h_in)
-
-    #         def forward_partial(h):
-    #             return mmodel.forward_layer(l, dataclasses.replace(inputs_for_jacobian, hidden_states=h), no_grad=False).hidden_states[0].reshape(-1)[output_start:output_end]
-
-    #         J = torch.autograd.functional.jacobian(forward_partial, h_in)
-    #         J = J.reshape(output_end - output_start, J_size)
-            
-    #         J_path = f"jacobians/layer_{l}/shard_{chunk_idx}.pt"
-    #         torch.save(J.float().cpu(), J_path)
-            
-            
-    #         del J
-    #         torch.cuda.empty_cache()
-            
-        
-        # jacobians.append(J)
+  
 
         # layer_inputs = mmodel.forward_layer(l, layer_inputs)  # advance with no_grad
         # # Advance h to the next layer's output (no grad needed)

@@ -45,6 +45,7 @@ class KFAC:
 
         return handles, activations, gradients
     
+    @staticmethod
     def compute_layer_gradients(
         mmodel,
         layer_inputs: LayerInputs,

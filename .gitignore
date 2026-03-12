@@ -1,2 +1,4 @@
 jacobians/
+full_jacobians/
+jacobians_threaded/
 __pycache__/*
