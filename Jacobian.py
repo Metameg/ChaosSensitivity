@@ -1,6 +1,7 @@
 from __future__ import annotations
 import dataclasses
 import torch
+import json
 from tqdm import tqdm
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -45,7 +46,8 @@ class Jacobian:
         # Tracks {layer_idx: [shard_paths]} after compute() is called
         self.shard_manifest: dict[int, list[Path]] = {}
         self.spectral_norms: dict[int, float] = {}
-        self.converged_vectors: dict[int, torch.Tensor] = {}  # ← add this
+        self.converged_vectors: dict[int, torch.Tensor] = {}  
+        self._layer_inputs_cache = {}
 
     def _compute_chunk(self, layer_idx: int, output_start: int, output_end: int) -> torch.Tensor:
         """Compute a single Jacobian chunk for the given output range."""
@@ -68,7 +70,7 @@ class Jacobian:
         self, 
         layer_idx: int, 
         steps: int | None = None,
-        tol: float = 1e-4,
+        tol: float = 1e-1,
     ) -> float:
         steps = steps or self.power_iter_steps
         paths = self.shard_manifest[layer_idx]
@@ -109,7 +111,7 @@ class Jacobian:
 
             sigma_prev = sigma_curr
 
-        print(f"  Warning: did not converge after {steps} steps, last σ₁ = {sigma_curr:.6f}")
+        print(f"  Warning: did not converge after {steps} steps, last sv = {sigma_curr:.6f}")
 
         self.spectral_norms[layer_idx] = sigma_curr
         self.converged_vectors[layer_idx] = v.clone()
@@ -128,12 +130,47 @@ class Jacobian:
         self.shard_manifest[layer_idx] = paths
 
 
+    def _save_spectral_data(self, layer_idx: int) -> None:
+        """Save spectral norm and converged vector for a layer to disk."""
+        layer_dir = self.save_dir / f"layer_{layer_idx}"
+
+        data = {
+            "sigma": self.spectral_norms[layer_idx],
+            "vector": self.converged_vectors[layer_idx],
+        }
+
+        # combined tensor/scalar bundle → single .pt
+        torch.save(data, layer_dir / "spectral.pt")
+
+        # human-readable scalar → JSON
+        with open(layer_dir / "spectral_data.json", "w") as f:
+            json.dump(data, f, indent=2)
+
+
+    def _load_spectral_data(self, layer_idx: int) -> bool:
+        """
+        Load spectral norm and converged vector from disk if they exist.
+        Returns True if found and loaded, False otherwise.
+        """
+        path = self.save_dir / f"layer_{layer_idx}" / "spectral.pt"
+        if not path.exists():
+            return False
+
+        data = torch.load(path, weights_only=True)
+        self.spectral_norms[layer_idx] = data["sigma"]
+        self.converged_vectors[layer_idx] = data["vector"]
+        return True
+    
+
     def compute(self) -> None:
         """Compute Jacobians for all layers, saving each chunk to disk."""
         for l, _ in enumerate(tqdm(self.layers, desc="Layers"), start=self.start_layer):
             layer_dir = self.save_dir / f"layer_{l}"
             layer_dir.mkdir(parents=True, exist_ok=True)
             self.shard_manifest[l] = []
+
+            # For compute_autograd testing
+            self._layer_inputs_cache[l] = self.layer_inputs
 
             chunk_indices = range(0, self.J_size, self.chunk_size)
             for chunk_idx, output_start in enumerate(tqdm(chunk_indices, desc=f"  Layer {l} chunks", leave=False)):
@@ -145,19 +182,25 @@ class Jacobian:
                 del J
                 torch.cuda.empty_cache()
 
-            # self.spectral_norms[l] = self._power_iteration_from_disk(l)
+            self.spectral_norms[l] = self._power_iteration_from_disk(l)
+            self._save_spectral_data(l)
 
             # thread hidden states forward to next layer
             with torch.no_grad():
                 self.layer_inputs = self.mmodel.forward_layer(l, self.layer_inputs, no_grad=True)
+
 
     def compute_autograd(self, layer_idx: int) -> torch.Tensor:
         """
         Compute the full Jacobian for a layer using torch.autograd.functional.jacobian.
         Only feasible for small layers where the full matrix fits in memory.
         """
-        h_in = self.layer_inputs.hidden_states.detach().requires_grad_(True)
-        inputs_for_jacobian = dataclasses.replace(self.layer_inputs, hidden_states=h_in)
+
+        # USE CACHED INPUTS for the requested layer, fall back to current if not cached
+        inputs = self._layer_inputs_cache.get(layer_idx, self.layer_inputs)
+
+        h_in = inputs.hidden_states.detach().requires_grad_(True)
+        inputs_for_jacobian = dataclasses.replace(inputs, hidden_states=h_in)
 
         def forward(h):
             updated_inputs = dataclasses.replace(inputs_for_jacobian, hidden_states=h)
@@ -196,6 +239,52 @@ class Jacobian:
         sigma = self._power_iteration_from_disk(layer_idx, steps)
         
         return sigma
+    
+    @classmethod
+    def load_from_disk(cls, mmodel, save_dir: str) -> "Jacobian":
+        """
+        Reconstruct a Jacobian instance from previously saved shards.
+        Does not require layer_inputs or recomputing anything.
+        """
+        save_dir = Path(save_dir)
+        if not save_dir.exists():
+            raise FileNotFoundError(f"No shard directory found at {save_dir}")
+
+        # infer J_size from the first shard found
+        first_shard = next(save_dir.glob("layer_*/shard_0.pt"))
+        J_chunk = torch.load(first_shard, weights_only=True)
+        J_size = J_chunk.shape[1]
+        del J_chunk
+
+        # infer hidden_size and seq_len from model config
+        hidden_size = mmodel.model.config.hidden_size
+        seq_len = J_size // hidden_size
+
+        # build a minimal instance without layer_inputs
+        instance = cls.__new__(cls)
+        instance.mmodel = mmodel
+        instance.layer_inputs = None
+        instance.save_dir = save_dir
+        instance.chunk_size = None
+        instance.power_iter_steps = 20
+        instance.start_layer = None
+        instance.layers = mmodel.model.model.layers
+        instance.seq_len = seq_len
+        instance.J_size = J_size
+        instance.shard_manifest = {}
+        instance.spectral_norms = {}
+        instance.converged_vectors = {}
+        instance.initial_layer_inputs = {}
+
+        # scan disk to populate shard_manifest
+        for layer_dir in sorted(save_dir.glob("layer_*"), key=lambda p: int(p.name.split("_")[1])):
+            l = int(layer_dir.name.split("_")[1])
+            shards = sorted(layer_dir.glob("shard_*.pt"), key=lambda p: int(p.stem.split("_")[1]))
+            if shards:
+                instance.shard_manifest[l] = shards
+                instance._load_spectral_data(l)
+
+        return instance
     
 
 
@@ -573,7 +662,7 @@ class JacobianVisualizer:
         """
         self._rc()
 
-        mat     = self._build_sensitivity_matrix()   # [n_layers, seq_len]
+        mat = self._build_sensitivity_matrix()   # [n_layers, seq_len]
         n_layers, seq_len = mat.shape
 
         if token_labels is not None and len(token_labels) != seq_len:

@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib import patheffects
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
@@ -234,10 +235,53 @@ class KFAC:
                 ).item()
 
 
-    def run(self, layer_inputs: LayerInputs, verify: bool = False):
+
+    def _save_kfac_data(self, save_dir: str) -> None:
+        """Save max_eigenvalues and gradient_projections to disk."""
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "max_eigenvalues": self.max_eigenvalues,
+            "gradient_projections": self.gradient_projections,
+            "eigenvalues": self.eigenvalues,
+            "top_eigenvectors": self.top_eigenvectors,
+        }, save_dir / "kfac_data.pt")
+
+
+    def _load_kfac_data(self, save_dir: str) -> bool:
+        """
+        Load kfac data from disk if it exists.
+        Returns True if found and loaded, False otherwise.
+        """
+        path = Path(save_dir) / "kfac_data.pt"
+        if not path.exists():
+            return False
+        data = torch.load(path, weights_only=True)
+        self.max_eigenvalues = data["max_eigenvalues"]
+        self.gradient_projections = data["gradient_projections"]
+        self.eigenvalues = data["eigenvalues"]
+        self.top_eigenvectors = data["top_eigenvectors"]
+        return True
+    
+
+    @classmethod
+    def load_from_disk(cls, mmodel, layers, target_token_id, save_dir: str) -> "KFAC":
+        """
+        Reconstruct a KFAC instance from previously saved data.
+        Does not require rerunning collect_factors.
+        """
+        instance = cls(mmodel, layers, target_token_id)
+        loaded = instance._load_kfac_data(save_dir)
+        if not loaded:
+            raise FileNotFoundError(f"No kfac_data.pt found in {save_dir}")
+        return instance
+
+
+
+    def run(self, layer_inputs: LayerInputs, save_dir: str = "kfac", verify: bool = False):
         self.collect_factors(layer_inputs, verify)
-        # self.compute_eigenvalues()
-        # self.compute_gradient_projections()
+        self._save_kfac_data(save_dir)
+
         return self.max_eigenvalues, self.gradient_projections
     
 

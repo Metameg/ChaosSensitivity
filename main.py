@@ -1,6 +1,6 @@
 import os
-from pathlib import Path
 import torch
+from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.llama.modeling_llama import create_causal_mask
 import dataclasses
@@ -9,6 +9,7 @@ import contextlib
 from tqdm import tqdm
 from pprint import pprint
 from KFAC import KFAC, KFACVisualizer
+from Lyapunov import Lyapunov, LyapunovVisualizer
 from data_types import LayerInputs
 from Jacobian import Jacobian, JacobianVisualizer
 
@@ -130,72 +131,91 @@ if __name__ == '__main__':
     J_size = seq_len * mmodel.model.config.hidden_size
     
 
-
-    # layers = mmodel.model.model.layers
+    # Run KFAC (builds FIM), save to disk
+    layers = mmodel.model.model.layers
     # kfac = KFAC(mmodel, layers, target_token_id)
-    # max_eigenvalues, gradient_projections = kfac.run(layer_inputs)
+    # max_eigenvalues, gradient_projections = kfac.run(layer_inputs, save_dir=Path("data", "kfac"))
+
+    # Load KFAC from disk
+    kfac = KFAC.load_from_disk(mmodel, layers, target_token_id, save_dir=Path("data", "kfac"))
+    
+    
+    # # Run Jacobian, save to disk
+    # jac = Jacobian(mmodel, 
+    #                layer_inputs,
+    #                save_dir=Path("data", "jacobian"),
+    #                chunk_size=256,
+    #                start_layer=0)
+    # jac.compute()
+
+    # Load Jacobian from disk
+    jac = Jacobian.load_from_disk(mmodel, save_dir=Path("data", "jacobian"))
+
+
+
+    # # Re-run power iteration for each layer from saved shards
+    # for layer_idx in sorted(jac.shard_manifest.keys()):
+    #     print(f"\nLayer {layer_idx}:")
+    #     jac._reload_manifest_from_disk(layer_idx)
+    #     sigma = jac._power_iteration_from_disk(layer_idx, tol=1e-1)
+    #     jac._save_spectral_data(layer_idx)
+    #     print(f"  σ₁ = {sigma:.6f}")
+
+   
+
+
+
+
+    # # run Lyapunov
+    # lyap = Lyapunov(jac)
+    # result = lyap.compute(k=1)
+    # alignments = lyap.alignment_with_layer_vectors()
+
+    result = Lyapunov.load_lyapunov_run(Path("data", "lyapunov"))
+
+    class _StubLyapunov:
+        def __init__(self, result, alignments: dict = None):
+            self.result = result
+            self._alignments = alignments or {}
+
+        def alignment_with_layer_vectors(self) -> dict:
+            return self._alignments
+
+
+    lyap_viz = LyapunovVisualizer(_StubLyapunov(result))
+    lyap_viz.plot_spectrum(savepath=Path("plots", "spectrum.png"))
+    lyap_viz.plot_alignment_heatmap(savepath=Path("plots", "alignment.png"))
+    # lyap_viz.plot_all(savepath=Path("plots", "lyapunov_all.pdf"))
+
+
+    # Visualize KFAC
 
     # kfac_viz = KFACVisualizer(kfac)
 
     # # Raw projection heatmap + layer summary
-    # kfac_viz.plot_all(save_path="kfac_raw.png")
+    # kfac_viz.plot_all(save_path=Path("plots", "kfac_raw.png"))
 
     # # Curvature-weighted version
     # # kfac_viz.plot_all(scale_by_curvature=True, save_path="kfac_weighted.png")
     # kfac_viz.plot_layer_summary()
-    # kfac_viz.plot_quiver(save_path="quiver.png")
-
-    jac = Jacobian(mmodel, 
-                   layer_inputs,
-                   save_dir="jacobians_threaded",
-                   chunk_size=256,
-                   start_layer=1)
-    jac.compute()
-    # Reload shards and rerun power iteration for all layers
-    # n_layers = len(mmodel.model.model.layers)
-    # for l in range(0, 3):
-    #     jac._reload_manifest_from_disk(l)
-    #     jac.spectral_norm_from_disk(l)  # populates spectral_norms and converged_vectors
+    # kfac_viz.plot_quiver(save_path=Path("plots", "quiver.png"))
 
 
-    # # Decode tokens for the sensitivity heatmap x-axis
-    # token_ids = input_ids[0].tolist()
-    # token_labels = [mmodel.tokenizer.decode([t]) for t in token_ids]
+    # Visualize Jacobian
+    # Get prompt token ids
+    token_ids = input_ids[0].tolist()
+    token_labels = [mmodel.tokenizer.decode([t]) for t in token_ids]
 
-    # # jac_viz = JacobianVisualizer(jac)
-    # # jac_viz.plot_spectral_profile(kfac=kfac, save_path="plots/spectral_profile_jacobian.png")
-    # # jac_viz.plot_sensitivity_heatmap(token_labels=token_labels, save_path="plots/jacobian_sensitivity_heatmap.png")
-    # # jac_viz.plot_correlation_scatter(kfac, save_path="plots/eigen-singular-correlation.png")
+    jac_viz = JacobianVisualizer(jac)
+    jac_viz.plot_spectral_profile(kfac=kfac, save_path="plots/spectral_profile_jacobian.png")
+    jac_viz.plot_sensitivity_heatmap(token_labels=token_labels, save_path="plots/jacobian_sensitivity_heatmap.png")
+    jac_viz.plot_correlation_scatter(kfac, save_path="plots/eigen-singular-correlation.png")
     
 
 
   
 
-        # layer_inputs = mmodel.forward_layer(l, layer_inputs)  # advance with no_grad
-        # # Advance h to the next layer's output (no grad needed)
-        # with torch.no_grad():
-           
-        #     h = layer(
-        #         h_in,
-        #         attention_mask=layer_inputs.causal_mask,
-        #         position_embeddings=layer_inputs.position_embeddings,
-        #         cache_position=layer_inputs.cache_position,
-        #     )
-
-        # # Probe: project the last token's hidden state through norm + lm_head
-        # with torch.no_grad():
-        #     last_token_h = layer_inputs.hidden_states[:, -1, :]           # shape: [1, hidden_size]
-        #     normed = mmodel.norm(last_token_h)
-        #     logits = mmodel.lm_head(normed)       # shape: [1, vocab_size]
-        #     probs = torch.softmax(logits, dim=-1)
-
-        #     top_k = 10
-        #     top_probs, top_ids = torch.topk(probs[0], top_k)
-        #     argmax_id = top_ids[0].item()
-        #     argmax_token = mmodel.tokenizer.decode([argmax_id])
-        #     print(f"\n--- After layer {l} ---")
-        #     print(f"Argmax token: '{argmax_token}' (id={argmax_id}, prob={top_probs[0].item():.4f})")
-
+       
         
 
             
